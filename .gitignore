@@ -1,0 +1,9 @@
+# PhysioNet MIT-BIH dataset (large; download separately)
+mit-bih-arrhythmia-database-1.0.0/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
