@@ -67,13 +67,15 @@ def segment_record(record_name, data_path):
         data_path: Path to the MIT-BIH database directory
     Returns:
         X_raw: List of raw ECG windows (180 samples each)
-        y_raw: List of labels (0, 1, or 2)
+        y_raw: Labels 0=N, 1=V, 2=PAC (MIT-BIH symbols A and a)
         record_ids: List of record IDs (same length as X_raw)
+        peak_samples_record: Absolute R-peak sample index per beat (same length as X_raw)
         n_beats: Number of beats extracted from this record
     """
     X_raw_record = []
     y_raw_record = []
     record_ids_record = []
+    peak_samples_record = []
     
     # Window size: 180 samples (90 before + 90 after the R-peak)
     window_size = 180
@@ -103,8 +105,8 @@ def segment_record(record_name, data_path):
         r_peak_pos = r_peak_indices[i]
         beat_type = beat_types[i]
         
-        # Only keep beat types N, V, or a
-        if beat_type not in ['N', 'V', 'a']:
+        # Only N, V, and PAC: A = atrial premature, a = aberrant atrial premature
+        if beat_type not in ('N', 'V', 'A', 'a'):
             continue
         
         # Extract window centered on R-peak
@@ -122,23 +124,22 @@ def segment_record(record_name, data_path):
         if len(window) != window_size:
             continue
         
-        # Convert beat type to number: N → 0, V → 1, a → 2
+        # N → 0, V → 1, A or a → 2 (PAC / aberrant PAC)
         if beat_type == 'N':
             label = 0
         elif beat_type == 'V':
             label = 1
-        elif beat_type == 'a':
-            label = 2
         else:
-            continue
+            label = 2
         
-        # Store window, label, and record ID
+        # Store window, label, record ID, and R-peak index (for RR features)
         X_raw_record.append(window)
         y_raw_record.append(label)
         record_ids_record.append(record_name)
+        peak_samples_record.append(int(r_peak_pos))
     
     n_beats = len(X_raw_record)
-    return X_raw_record, y_raw_record, record_ids_record, n_beats
+    return X_raw_record, y_raw_record, record_ids_record, peak_samples_record, n_beats
 
 
 def correct_baseline_wander(window):
@@ -182,29 +183,70 @@ def normalize_beat(window):
     return (window - window_mean) / window_std
 
 
-def preprocess_beats(X_raw, y_raw, record_ids):
+def compute_rr_features(peak_indices):
+    """
+    RR-interval ratio features per beat: [RR_pre/median(RR), RR_post/median(RR)]
+    within one record (peak_indices in sample order).
+    """
+    peak_indices = np.asarray(peak_indices, dtype=int)
+    n = len(peak_indices)
+    if n < 2:
+        return np.ones((n, 2), dtype=float)
+    rr = np.diff(peak_indices).astype(float)
+    med = np.median(rr)
+    if med <= 0:
+        med = 1.0
+    feats = np.ones((n, 2), dtype=float)
+    for i in range(n):
+        feats[i, 0] = (rr[i - 1] / med) if i > 0 else (rr[0] / med)
+        feats[i, 1] = (rr[i] / med) if i < n - 1 else (rr[-1] / med)
+    return feats
+
+
+def rr_features_for_labeled_beats(peak_samples, record_ids):
+    """
+    Stack RR features for a full dataset: one row per beat, grouped by record_id.
+    Requires beats from each record in chronological order (same as segment_record output).
+    """
+    peak_samples = np.asarray(peak_samples, dtype=int)
+    record_ids = np.asarray(record_ids)
+    n = len(peak_samples)
+    out = np.ones((n, 2), dtype=float)
+    for rid in np.unique(record_ids):
+        mask = record_ids == rid
+        idx = np.flatnonzero(mask)
+        peaks = peak_samples[idx]
+        rr = compute_rr_features(peaks)
+        out[idx] = rr
+    return out
+
+
+def preprocess_beats(X_raw, y_raw, record_ids, peak_samples=None):
     """
     Apply preprocessing pipeline to beat windows.
     
     Steps:
     1. Baseline wander correction (detrending)
     2. Per-beat mean-std normalization
-    3. Filter to ensure exactly 3 classes (N=0, V=1, a=2)
+    3. Filter to ensure exactly 3 classes (N=0, V=1, PAC=2 with A and a)
     
     Args:
         X_raw: numpy array of shape (n_beats, 180)
         y_raw: numpy array of shape (n_beats,) with labels
         record_ids: numpy array of shape (n_beats,) with record IDs
+        peak_samples: Optional 1D array of R-peak indices per beat (aligned with X_raw rows)
     Returns:
         X: Preprocessed beats, shape (n_beats, 180)
         y: Filtered labels, shape (n_beats,)
         record_ids_filtered: Filtered record IDs, shape (n_beats,)
         stats: Dictionary with preprocessing statistics
+        peak_samples_filtered: R-peak indices aligned with X (None if peak_samples was None)
     """
     n_beats = len(X_raw)
     X_processed = []
     y_processed = []
     record_ids_processed = []
+    peaks_processed = []
     
     # Track statistics
     stats = {
@@ -234,6 +276,8 @@ def preprocess_beats(X_raw, y_raw, record_ids):
         X_processed.append(window)
         y_processed.append(label)
         record_ids_processed.append(record_id)
+        if peak_samples is not None:
+            peaks_processed.append(int(peak_samples[i]))
         stats['class_counts'][label] += 1
     
     # Convert to numpy arrays
@@ -241,8 +285,13 @@ def preprocess_beats(X_raw, y_raw, record_ids):
     y = np.array(y_processed)
     record_ids_filtered = np.array(record_ids_processed)
     stats['n_output'] = len(X)
+    peak_out = (
+        np.array(peaks_processed, dtype=int)
+        if peak_samples is not None
+        else None
+    )
     
-    return X, y, record_ids_filtered, stats
+    return X, y, record_ids_filtered, stats, peak_out
 
 
 def split_by_record(X, y, record_ids, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_seed=42):

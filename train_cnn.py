@@ -266,7 +266,9 @@ def train_cnn_model(X_train, y_train, X_val, y_val, class_weights, epochs=50, ba
     print(f"\nTraining parameters:")
     print(f"  Epochs: {epochs}")
     print(f"  Batch size: {batch_size}")
-    print(f"  Class weights: {class_weight_dict}")
+    print("  Class weights:")
+    for k in sorted(class_weight_dict.keys()):
+        print(f"    {k}: {float(class_weight_dict[k])}")
     print(f"  Optimizer: Adam (lr=0.0001)")
     print(f"  Loss: sparse_categorical_crossentropy")
     print(f"  Callbacks: EarlyStopping(patience=15), ReduceLROnPlateau(patience=5, factor=0.5)")
@@ -288,7 +290,7 @@ def train_cnn_model(X_train, y_train, X_val, y_val, class_weights, epochs=50, ba
     return model, history
 
 
-def evaluate_model(model, X, y, split_name, class_names):
+def evaluate_model(model, X, y, split_name, class_names, architecture_name="1D CNN"):
     """
     Evaluate model and print comprehensive metrics.
     
@@ -298,12 +300,13 @@ def evaluate_model(model, X, y, split_name, class_names):
         y: True labels, shape (n_samples,)
         split_name: String name of split ('Train', 'Val', 'Test')
         class_names: Dictionary mapping class_id to name
+        architecture_name: Label printed in the metrics banner (e.g. "ResNet-1D")
     """
     # Reshape for Conv1D: (n_samples, 180) -> (n_samples, 180, 1)
     X_reshaped = X.reshape(X.shape[0], X.shape[1], 1)
     
     # Get predictions
-    y_pred_proba = model.predict(X_reshaped, verbose=0)
+    y_pred_proba = model.predict(X_reshaped, verbose=0, batch_size=512)
     y_pred = np.argmax(y_pred_proba, axis=1)
     
     # Compute confusion matrix
@@ -320,7 +323,7 @@ def evaluate_model(model, X, y, split_name, class_names):
     
     # Print results
     print("\n" + "="*50)
-    print(f"STEP 4: 1D CNN MODEL - {split_name.upper()} SET")
+    print(f"STEP 4: {architecture_name.upper()} MODEL - {split_name.upper()} SET")
     print("="*50)
     
     # Confusion matrix
@@ -387,7 +390,9 @@ if __name__ == "__main__":
     record_ids_all = []
     
     for record_name in record_names:
-        X_raw_record, y_raw_record, record_ids_record, n_beats = segment_record(record_name, data_path)
+        X_raw_record, y_raw_record, record_ids_record, _, n_beats = segment_record(
+            record_name, data_path
+        )
         X_raw_all.extend(X_raw_record)
         y_raw_all.extend(y_raw_record)
         record_ids_all.extend(record_ids_record)
@@ -407,7 +412,7 @@ if __name__ == "__main__":
     print("STEP 2: PREPROCESSING ECG BEATS")
     print("="*50)
     
-    X, y, record_ids_filtered, stats = preprocess_beats(X_raw, y_raw, record_ids)
+    X, y, record_ids, stats, _ = preprocess_beats(X_raw, y_raw, record_ids)
     
     print(f"\nPreprocessing complete:")
     print(f"  Input beats:  {stats['n_input']}")
@@ -460,8 +465,9 @@ if __name__ == "__main__":
     print(f"  X_test shape: {X_test.shape}")
     print(f"  y_test shape: {y_test.shape}")
     print(f"  record_ids_test: {len(np.unique(record_ids_test))} unique records")
-    class_weights_display = {k: float(v) for k, v in class_weights.items()}
-    print(f"\nClass weights: {class_weights_display}")
+    print("\nClass weights:")
+    for k in sorted(class_weights.keys()):
+        print(f"  {k}: {float(class_weights[k])}")
     
     # ========================================================================
     # STEP 4: CNN MODEL TRAINING AND EVALUATION

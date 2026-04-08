@@ -1,3 +1,7 @@
+"""
+MIT-BIH pipeline: uses database R-peak annotations. For a raw CSV recording without labels,
+use classify_custom_ecg.py (R-peak detection + same classifier / preprocessing).
+"""
 import os
 import numpy as np
 import wfdb
@@ -9,8 +13,11 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+from ecg_preprocessing import rr_features_for_labeled_beats
+
 # Scikit-learn imports for baseline ML model
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -46,102 +53,92 @@ def segment_record(record_name, data_path):
         data_path: Path to the MIT-BIH database directory
     Returns:
         X_raw: List of raw ECG windows (180 samples each)
-        y_raw: List of labels (0, 1, or 2)
+        y_raw: Labels 0=N, 1=V, 2=PAC (MIT-BIH symbols A and a)
         record_ids: List of record IDs (same length as X_raw)
+        peak_samples: R-peak sample index per beat (for RR features)
         n_beats: Number of beats extracted from this record
     """
     X_raw_record = []
     y_raw_record = []
     record_ids_record = []
-    
-    # Window size: 180 samples (90 before + 90 after the R-peak)
+    peak_samples_record = []
+
     window_size = 180
     half_window = 90
-    
-    # Change to the data directory temporarily (some wfdb versions don't support base_dir)
+
     original_dir = os.getcwd()
     os.chdir(data_path)
-    
+
     try:
-        # Load ECG signal
         record = wfdb.rdrecord(record_name)
         ecg_signal = record.p_signal[:, 0]
-        
-        # Load annotations
-        annotations = wfdb.rdann(record_name, 'atr')
+        annotations = wfdb.rdann(record_name, "atr")
     finally:
-        # Change back to the original directory
         os.chdir(original_dir)
-    
-    # Get R-peak indices and beat types
+
     r_peak_indices = annotations.sample
     beat_types = annotations.symbol
-    
-    # Loop through each R-peak annotation
+
     for i in range(len(r_peak_indices)):
-        r_peak_pos = r_peak_indices[i]
+        r_peak_pos = int(r_peak_indices[i])
         beat_type = beat_types[i]
-        
-        # Only keep beat types N, V, or a
-        if beat_type not in ['N', 'V', 'a']:
+
+        if beat_type not in ("N", "V", "A", "a"):
             continue
-        
-        # Extract window centered on R-peak
+
         window_start = r_peak_pos - half_window
         window_end = r_peak_pos + half_window
-        
-        # Skip if window goes out of bounds
+
         if window_start < 0 or window_end > len(ecg_signal):
             continue
-        
-        # Extract the 180-sample window
+
         window = ecg_signal[window_start:window_end]
-        
-        # Safety check
+
         if len(window) != window_size:
             continue
-        
-        # Convert beat type to number: N → 0, V → 1, a → 2
-        if beat_type == 'N':
+
+        if beat_type == "N":
             label = 0
-        elif beat_type == 'V':
+        elif beat_type == "V":
             label = 1
-        elif beat_type == 'a':
-            label = 2
         else:
-            continue
-        
-        # Store window, label, and record ID
+            label = 2
+
         X_raw_record.append(window)
         y_raw_record.append(label)
         record_ids_record.append(record_name)
-    
+        peak_samples_record.append(r_peak_pos)
+
     n_beats = len(X_raw_record)
-    return X_raw_record, y_raw_record, record_ids_record, n_beats
+    return X_raw_record, y_raw_record, record_ids_record, peak_samples_record, n_beats
 
 # ============================================================================
 # STEP 1: SEGMENTATION (Multiple Records)
 # ============================================================================
 # Process all MIT-BIH records and aggregate beat windows
 # Extract 180-sample windows centered on MIT-BIH annotated R-peaks
-# Filter to 3 classes (N, V, a)
+# Filter to 3 classes (N, V, PAC with A and a)
 # Output: Raw windows X_raw and labels y_raw (before preprocessing)
 
 # Initialize lists to store windows, labels, and record IDs (aggregated across all records)
 X_raw = []  # List to store raw ECG windows (each window is 180 samples)
 y_raw = []  # List to store labels (0, 1, or 2)
 record_ids = []  # List to store record ID for each beat (for patient-safe splitting)
+peak_samples_list = []  # R-peak indices (MIT samples), aligned with X_raw rows
 
 # Process each record
 print("\nProcessing records...")
 for idx, record_name in enumerate(record_names, 1):
     try:
-        X_raw_record, y_raw_record, record_ids_record, n_beats = segment_record(record_name, data_path)
-        
+        X_raw_record, y_raw_record, record_ids_record, peaks_record, n_beats = segment_record(
+            record_name, data_path
+        )
+
         # Aggregate results
         X_raw.extend(X_raw_record)
         y_raw.extend(y_raw_record)
         record_ids.extend(record_ids_record)
+        peak_samples_list.extend(peaks_record)
         
         print(f"  [{idx}/{len(record_names)}] Record {record_name}: {n_beats} beats extracted")
     except Exception as e:
@@ -152,6 +149,7 @@ for idx, record_name in enumerate(record_names, 1):
 X_raw = np.array(X_raw)
 y_raw = np.array(y_raw)
 record_ids = np.array(record_ids)  # Array of record IDs (strings)
+peak_samples = np.asarray(peak_samples_list, dtype=int)
 
 # Print aggregated Step 1 results
 print("\n" + "="*50)
@@ -290,7 +288,7 @@ def print_preprocessing_stats(X, y, stats):
     print("="*50)
     print(f"Total samples: {n_total}")
     print(f"Window shape: {X.shape}")
-    
+
     # Class distribution
     print(f"\nClass distribution:")
     class_names = {
@@ -324,6 +322,25 @@ X, y, record_ids, preprocessing_stats = preprocess_beats(X_raw, y_raw, record_id
 
 # Print preprocessing statistics
 print_preprocessing_stats(X, y, preprocessing_stats)
+
+# Extra features + RR: linear models mix 180 morph dims with small RR/skew ranges — scale later
+assert len(peak_samples) == len(X), "peak_samples must align with preprocessed beats"
+print("\n" + "=" * 50)
+print("STEP 2b: BASELINE FEATURES (skew + RR timing)")
+print("=" * 50)
+X_morph = X
+if HAS_SCIPY:
+    from scipy.stats import skew as scipy_skew
+
+    sk = scipy_skew(X_morph, axis=1, bias=False, nan_policy="omit")
+    sk = np.nan_to_num(sk, nan=0.0, posinf=0.0, neginf=0.0)
+else:
+    sk = np.zeros(len(X_morph), dtype=float)
+print("  Per-beat skew (morphology summary, 1 feature).")
+rr_feat = rr_features_for_labeled_beats(peak_samples, record_ids)
+print("  RR: RR_pre/median, RR_post/median (per record).")
+X = np.hstack([X_morph, sk.reshape(-1, 1), rr_feat])
+print(f"  Final feature shape: {X.shape} = 180 beat samples + 1 skew + 2 RR ratios")
 
 # ============================================================================
 # STEP 3: DATASET STATS + WEIGHTS + SPLIT
@@ -715,47 +732,49 @@ print(f"\nTest set:")
 print(f"  X_test shape: {X_test.shape}")
 print(f"  y_test shape: {y_test.shape}")
 print(f"  record_ids_test: {len(np.unique(record_ids_test))} unique records")
-# Format class weights for cleaner display (remove numpy type prefixes)
-class_weights_display = {k: float(v) for k, v in class_weights.items()}
-print(f"\nClass weights: {class_weights_display}")
+print("\nClass weights:")
+for k in sorted(class_weights.keys()):
+    print(f"  {k}: {float(class_weights[k])}")
+
+print("\n" + "=" * 50)
+print("STEP 3b: STANDARDIZE FEATURES (train only, patient-safe)")
+print("=" * 50)
+_feature_scaler = StandardScaler()
+X_train = _feature_scaler.fit_transform(X_train)
+X_val = _feature_scaler.transform(X_val)
+X_test = _feature_scaler.transform(X_test)
+print("  Fit StandardScaler on X_train; applied to val/test (no leakage).")
 
 # ============================================================================
 # STEP 4: BASELINE MODEL TRAINING AND EVALUATION
 # ============================================================================
 
-def train_baseline_model(X_train, y_train, class_weights):
+def train_baseline_model(X_train, y_train):
     """
-    Train a multiclass logistic regression model with class weights.
-    
+    Train multiclass LogisticRegression with balanced class weights.
+
     Args:
-        X_train: Training features, shape (n_samples, 180)
+        X_train: Training features (scaled), shape (n_samples, 183)
         y_train: Training labels, shape (n_samples,)
-        class_weights: Dictionary {class_id: weight}
     Returns:
         model: Trained LogisticRegression model
     """
     print("\n" + "="*50)
     print("STEP 4: TRAINING BASELINE MODEL")
     print("="*50)
-    
-    # Create model with improved settings for imbalanced classes
-    # Use manual class weights with better hyperparameters
-    # Lower C (0.1) for stronger regularization to help minority classes
-    # Use 'lbfgs' solver which handles multiclass well
-    # Higher max_iter to ensure convergence
-    
+
     print("Training logistic regression model...")
-    print(f"  Using computed class weights: {class_weights}")
-    print(f"  Solver: lbfgs")
-    print(f"  Regularization (C): 0.1 (stronger regularization for imbalanced classes)")
-    print(f"  Max iterations: 2000")
-    
+    print("  class_weight='balanced' (stable default for heavy imbalance)")
+    print("  Solver: lbfgs, multi_class: multinomial")
+    print("  Regularization C: 1.0  (inputs are standardized)")
+    print("  Max iterations: 8000")
+
     model = LogisticRegression(
-        class_weight=class_weights,  # Use computed weights
-        solver='lbfgs',
-        C=0.1,  # Lower C = stronger regularization (helps minority classes)
-        max_iter=2000,
-        random_state=42
+        class_weight="balanced",
+        solver="lbfgs",
+        C=1.0,
+        max_iter=8000,
+        random_state=42,
     )
     
     model.fit(X_train, y_train)
@@ -775,10 +794,10 @@ def train_baseline_model(X_train, y_train, class_weights):
 def evaluate_model(model, X, y, split_name, class_names):
     """
     Evaluate model and print comprehensive metrics.
-    
+
     Args:
         model: Trained model
-        X: Features, shape (n_samples, 180)
+        X: Features, shape (n_samples, 183) after skew + RR + StandardScaler
         y: True labels, shape (n_samples,)
         split_name: String name of split ('Train', 'Val', 'Test')
         class_names: Dictionary mapping class_id to name
@@ -837,8 +856,8 @@ def evaluate_model(model, X, y, split_name, class_names):
     print(f"  Balanced Accuracy: {balanced_acc:.4f}")
 
 
-# Train model
-model = train_baseline_model(X_train, y_train, class_weights)
+# Train model (class_weight inside estimator; inverse-freq weights above are informational only)
+model = train_baseline_model(X_train, y_train)
 
 # Class name mapping
 class_names = {

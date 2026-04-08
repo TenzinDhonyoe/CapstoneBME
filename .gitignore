@@ -6,4 +6,5 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+tf_env/
 .env
