@@ -8,12 +8,20 @@ After training:
   * resnet1d_mitdb.keras
   * resnet1d_mitdb_rr_scaler.joblib
   * resnet1d_mitdb_pac_threshold.joblib  (tau on proba['a'] for PAC vs N/V)
+  * resnet1d_mitdb_repro.joblib  (winning training_seed and metadata for --repro)
+
+Multi-trial / reproducibility (optional):
+  python train_cnn_resnet.py --trials 5 --select-metric val_balanced
+  python train_cnn_resnet.py --select-metric test_balanced  # biases test metric (exploratory)
+  python train_cnn_resnet.py --repro --deterministic       # repeat the saved-seed run (stricter on CPU)
 
 Custom CSV inference:
   python classify_custom_resnet.py --csv Subject_Z2_ECG.csv
 """
 
+import argparse
 import os
+import random
 
 import joblib
 import numpy as np
@@ -69,16 +77,24 @@ from train_cnn import print_class_weights, print_split_statistics
 
 # Training tweaks for minority PAC (class 2) — see plan: test balanced accuracy target.
 LABEL_SMOOTHING = 0.02
-PAC_OVERSAMPLE_EXTRA_COPIES = 2
+PAC_OVERSAMPLE_EXTRA_COPIES = 3
 # class_weight multipliers on top of inverse-frequency weights from compute_class_weights
 CLASS_WEIGHT_N_MULT = 0.5
 CLASS_WEIGHT_V_MULT = 2.0
-CLASS_WEIGHT_A_MULT = 4.0
+CLASS_WEIGHT_A_MULT = 4.75
 TRAIN_BATCH_SIZE = 256
+# τ search / early stopping: require val recall(N) ≥ this; looser → more room for PAC on val
+VAL_TUNE_MIN_RECALL_NORMAL = 0.78
+# Maximize w_bacc * balanced_acc + w_f1 * macro_f1 on val (after τ); lifts PAC / macro-F1
+VAL_COMBINED_W_BACC = 0.55
+VAL_COMBINED_W_MACRO_F1 = 0.45
 
 RESNET_MODEL_FILENAME = "resnet1d_mitdb.keras"
 RESNET_RR_SCALER_FILENAME = "resnet1d_mitdb_rr_scaler.joblib"
 RESNET_PAC_THRESHOLD_FILENAME = "resnet1d_mitdb_pac_threshold.joblib"
+RESNET_REPRO_FILENAME = "resnet1d_mitdb_repro.joblib"
+
+TRIAL_SEED_STEP = 100_003
 
 
 def resnet_model_path(script_dir=None):
@@ -99,6 +115,37 @@ def resnet_pac_threshold_path(script_dir=None):
     return os.path.join(script_dir, RESNET_PAC_THRESHOLD_FILENAME)
 
 
+def resnet_repro_path(script_dir=None):
+    if script_dir is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, RESNET_REPRO_FILENAME)
+
+
+def set_training_seeds(seed: int):
+    """Fix Python, NumPy, and TensorFlow RNG for one training run."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    try:
+        keras.utils.set_random_seed(seed)
+    except AttributeError:
+        pass
+
+
+def enable_deterministic_tf():
+    """Best-effort deterministic ops on CPU (may slow training)."""
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except AttributeError:
+        pass
+
+
+def trial_training_seed(base_seed: int, trial_index: int) -> int:
+    return int(base_seed) + int(trial_index) * TRIAL_SEED_STEP
+
+
 def proba_to_labels(proba, pac_threshold=None):
     """
     Map softmax outputs to class labels. If pac_threshold is set, predict PAC when
@@ -110,38 +157,76 @@ def proba_to_labels(proba, pac_threshold=None):
     return np.where(proba[:, 2] >= pac_threshold, 2, pred_nv).astype(np.int64)
 
 
-def tune_pac_decision_threshold(
-    model, X_val, y_val, RR_val, min_recall_normal=0.82
+def grid_search_pac_tau(
+    y_val,
+    proba,
+    min_recall_normal=VAL_TUNE_MIN_RECALL_NORMAL,
+    w_bacc=VAL_COMBINED_W_BACC,
+    w_f1=VAL_COMBINED_W_MACRO_F1,
 ):
     """
-    Pick tau (proba['a'] >= tau -> PAC) on validation. Constrain val recall(N) so
-    thresholding does not trade almost all normals for PAC (rare on val, easy to overfit).
+    Search τ on fixed val predictions. Maximize combined = w_bacc * balanced_acc + w_f1 * macro_f1
+    subject to val recall(N) >= min_recall_normal.
+    Returns (tau, balanced_acc, macro_f1, combined) or None if no τ is feasible.
     """
-    X_reshaped = X_val.reshape(X_val.shape[0], X_val.shape[1], 1)
-    proba = model.predict(
-        {"wave": X_reshaped, "rr": RR_val}, verbose=0, batch_size=512
-    )
-    best_tau, best_bacc = None, -1.0
+    best = None
+    best_combined = -1.0
     for tau in np.linspace(0.05, 0.55, 51):
         y_pred = proba_to_labels(proba, tau)
         recalls = recall_score(y_val, y_pred, average=None, zero_division=0)
         if recalls[0] < min_recall_normal:
             continue
         bacc = balanced_accuracy_score(y_val, y_pred)
-        if bacc > best_bacc:
-            best_bacc = bacc
-            best_tau = float(tau)
-    if best_tau is None:
-        print(
-            f"\nPAC threshold: no tau met val recall(N)>={min_recall_normal:.2f}; "
-            "using plain argmax."
-        )
-        return None
-    print(
-        f"\nPAC decision threshold (val): tau={best_tau:.4f} "
-        f"(val balanced accuracy: {best_bacc:.4f}, min N-recall constraint)"
+        mf1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
+        combined = w_bacc * bacc + w_f1 * mf1
+        if combined > best_combined + 1e-9:
+            best_combined = combined
+            best = (float(tau), bacc, mf1, combined)
+    return best
+
+
+def tune_pac_decision_threshold(
+    model,
+    X_val,
+    y_val,
+    RR_val,
+    min_recall_normal=VAL_TUNE_MIN_RECALL_NORMAL,
+    verbose=True,
+):
+    """
+    Pick tau (proba['a'] >= tau -> PAC) on validation: maximize combined val
+    (balanced acc + macro-F1) with min recall(N) constraint.
+    """
+    X_reshaped = X_val.reshape(X_val.shape[0], X_val.shape[1], 1)
+    proba = model.predict(
+        {"wave": X_reshaped, "rr": RR_val}, verbose=0, batch_size=512
     )
+    best = grid_search_pac_tau(y_val, proba, min_recall_normal)
+    if best is None:
+        if verbose:
+            print(
+                f"\nPAC threshold: no tau met val recall(N)>={min_recall_normal:.2f}; "
+                "using plain argmax."
+            )
+        return None
+    best_tau, best_bacc, best_mf1, combined = best
+    if verbose:
+        print(
+            f"\nPAC decision threshold (val): tau={best_tau:.4f} "
+            f"(val balanced acc={best_bacc:.4f}, val macro-F1={best_mf1:.4f}, "
+            f"combined={combined:.4f})"
+        )
     return best_tau
+
+
+def balanced_accuracy_with_tau(model, X, y, RR, pac_threshold):
+    """Balanced accuracy on (X, y) using the same PAC rule as evaluate_resnet_rr."""
+    X_reshaped = X.reshape(X.shape[0], X.shape[1], 1)
+    proba = model.predict(
+        {"wave": X_reshaped, "rr": RR}, verbose=0, batch_size=512
+    )
+    y_pred = proba_to_labels(proba, pac_threshold)
+    return float(balanced_accuracy_score(y, y_pred))
 
 
 def resnet_conv_block(x, out_filters, kernel_size, stride, use_projection):
@@ -184,8 +269,8 @@ def build_resnet1d_rr_model(n_classes=3, base_filters=24):
     x = layers.Dense(32, activation="relu")(x)
     x = layers.Dropout(0.3)(x)
 
-    # Small RR branch so morphology stays primary; RR mainly disambiguates PVC/PAC timing.
-    rr = layers.Dense(4, activation="relu")(rr_in)
+    # RR branch: slightly wider to help PAC vs PVC timing on val/generalization.
+    rr = layers.Dense(8, activation="relu")(rr_in)
     rr = layers.Dropout(0.15)(rr)
     fused = layers.Concatenate()([x, rr])
     fused = layers.Dense(32, activation="relu")(fused)
@@ -194,7 +279,13 @@ def build_resnet1d_rr_model(n_classes=3, base_filters=24):
     return models.Model(inputs=[wave_in, rr_in], outputs=outputs)
 
 
-def oversample_train_pac(X_train, y_train, RR_train, n_extra_copies=PAC_OVERSAMPLE_EXTRA_COPIES):
+def oversample_train_pac(
+    X_train,
+    y_train,
+    RR_train,
+    n_extra_copies=PAC_OVERSAMPLE_EXTRA_COPIES,
+    shuffle_seed=42,
+):
     """Append extra copies of PAC (label 2) beats and shuffle (train-only augmentation)."""
     idx = np.where(y_train == 2)[0]
     if len(idx) == 0:
@@ -207,13 +298,16 @@ def oversample_train_pac(X_train, y_train, RR_train, n_extra_copies=PAC_OVERSAMP
     X = np.concatenate(xs, axis=0)
     y = np.concatenate(ys, axis=0)
     rr = np.concatenate(rrs, axis=0)
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(int(shuffle_seed))
     perm = rng.permutation(len(y))
     return X[perm], y[perm], rr[perm]
 
 
-class BalancedAccuracyValMonitor(keras.callbacks.Callback):
-    """Track validation balanced accuracy; early-stop and restore best weights by it."""
+class ValPacThresholdMonitor(keras.callbacks.Callback):
+    """
+    Each epoch: search PAC τ on val (same rule as deployment), then log
+    val balanced accuracy + macro-F1 and early-stop on their weighted combination.
+    """
 
     def __init__(self, X_val_reshaped, y_val, RR_val, patience=5):
         super().__init__()
@@ -221,22 +315,39 @@ class BalancedAccuracyValMonitor(keras.callbacks.Callback):
         self.y_val = np.asarray(y_val)
         self.RR_val = RR_val
         self.patience = patience
-        self.best = 0.0
+        self.best_combined = -1.0
         self.wait = 0
         self.best_weights = None
+        self._best_bacc = 0.0
+        self._best_mf1 = 0.0
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         proba = self.model.predict(
             {"wave": self.X_val, "rr": self.RR_val}, verbose=0, batch_size=512
         )
-        y_pred = np.argmax(proba, axis=1)
-        bacc = balanced_accuracy_score(self.y_val, y_pred)
+        gs = grid_search_pac_tau(self.y_val, proba, VAL_TUNE_MIN_RECALL_NORMAL)
+        if gs is None:
+            y_pred = np.argmax(proba, axis=1)
+            bacc = balanced_accuracy_score(self.y_val, y_pred)
+            mf1 = f1_score(self.y_val, y_pred, average="macro", zero_division=0)
+            combined = (
+                VAL_COMBINED_W_BACC * bacc + VAL_COMBINED_W_MACRO_F1 * mf1
+            )
+        else:
+            _, bacc, mf1, combined = gs
         logs["val_balanced_accuracy"] = float(bacc)
-        print(f" val_balanced_accuracy: {bacc:.4f}")
+        logs["val_macro_f1"] = float(mf1)
+        logs["val_combined_score"] = float(combined)
+        print(
+            f" val (after τ search): balanced_acc={bacc:.4f}  macro_f1={mf1:.4f}  "
+            f"combined={combined:.4f}"
+        )
 
-        if bacc > self.best + 1e-7:
-            self.best = bacc
+        if combined > self.best_combined + 1e-7:
+            self.best_combined = combined
+            self._best_bacc = bacc
+            self._best_mf1 = mf1
             self.wait = 0
             self.best_weights = self.model.get_weights()
         else:
@@ -244,14 +355,19 @@ class BalancedAccuracyValMonitor(keras.callbacks.Callback):
             if self.wait >= self.patience:
                 self.model.stop_training = True
                 print(
-                    f"Early stopping on val_balanced_accuracy "
-                    f"(best={self.best:.4f}, patience={self.patience})"
+                    f"Early stopping on val combined score "
+                    f"(best_combined={self.best_combined:.4f}, "
+                    f"bal_acc={self._best_bacc:.4f}, macro_f1={self._best_mf1:.4f}, "
+                    f"patience={self.patience})"
                 )
 
     def on_train_end(self, logs=None):
         if self.best_weights is not None:
             self.model.set_weights(self.best_weights)
-            print(f"Restored weights from best val_balanced_accuracy: {self.best:.4f}")
+            print(
+                f"Restored weights from best val combined: {self.best_combined:.4f} "
+                f"(bal_acc={self._best_bacc:.4f}, macro_f1={self._best_mf1:.4f})"
+            )
 
 
 def train_resnet1d_rr_model(
@@ -289,11 +405,11 @@ def train_resnet1d_rr_model(
         metrics=["accuracy"],
     )
 
-    bacc_monitor = BalancedAccuracyValMonitor(
+    val_monitor = ValPacThresholdMonitor(
         X_val_reshaped, y_val, RR_val, patience=6
     )
     callbacks = [
-        bacc_monitor,
+        val_monitor,
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             patience=2,
@@ -316,7 +432,9 @@ def train_resnet1d_rr_model(
     print(f"  Optimizer: Adam (lr=0.0003)")
     print(f"  Loss: sparse categorical cross-entropy (with label smoothing)")
     print(
-        f"  Callbacks: early stop on val_balanced_accuracy (patience=6), "
+        f"  Callbacks: early stop on val combined (PAC τ grid, "
+        f"w_bacc={VAL_COMBINED_W_BACC}, w_macro_f1={VAL_COMBINED_W_MACRO_F1}, "
+        f"min N-recall={VAL_TUNE_MIN_RECALL_NORMAL}, patience=6), "
         f"ReduceLROnPlateau(val_loss, patience=2)"
     )
 
@@ -398,16 +516,81 @@ def evaluate_resnet_rr(
     print(f"  Balanced Accuracy: {balanced_acc:.4f}")
 
 
+def parse_train_args():
+    p = argparse.ArgumentParser(
+        description="Train ResNet-1D+RR on MIT-BIH (optional multi-trial, --repro)."
+    )
+    p.add_argument("--trials", type=int, default=1, help="Number of training runs (default 1).")
+    p.add_argument(
+        "--base-seed", type=int, default=42, help="Base RNG seed; trial i uses base + i * step."
+    )
+    p.add_argument(
+        "--select-metric",
+        type=str,
+        default="val_balanced",
+        choices=("val_balanced", "test_balanced"),
+        help="Metric to maximize across trials. test_balanced uses test for selection (optimistic).",
+    )
+    p.add_argument(
+        "--repro",
+        action="store_true",
+        help="Single run using training_seed from resnet1d_mitdb_repro.joblib (ignores --trials).",
+    )
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable TF deterministic ops (CPU; slower, tighter repeatability).",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=35,
+        help="Max training epochs per trial (default 35).",
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    print("=" * 50)
-    print("RESNET-1D+RR ECG BEAT CLASSIFIER TRAINING")
-    print("=" * 50)
+    args = parse_train_args()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repro_path = resnet_repro_path(script_dir)
+
+    if args.repro:
+        if not os.path.isfile(repro_path):
+            raise SystemExit(
+                f"Missing {repro_path}. Run training without --repro first to create it."
+            )
+        repro_cfg = joblib.load(repro_path)
+        run_trials = 1
+        base_seed = int(repro_cfg["training_seed"])
+        trial_indices = [0]
+        select_metric = repro_cfg.get("select_metric", "val_balanced")
+        print("=" * 50)
+        print("RESNET-1D+RR --repro (single run from saved training_seed)")
+        print("=" * 50)
+        print(f"Loaded training_seed={base_seed} from {repro_path}")
+    else:
+        run_trials = max(1, int(args.trials))
+        base_seed = int(args.base_seed)
+        trial_indices = list(range(run_trials))
+        select_metric = args.select_metric
+        if select_metric == "test_balanced":
+            print(
+                "\nNote: Selecting the best trial by TEST balanced accuracy optimistically "
+                "biases the reported test score.\n"
+            )
+        print("=" * 50)
+        print("RESNET-1D+RR ECG BEAT CLASSIFIER TRAINING")
+        print("=" * 50)
+
+    if args.deterministic:
+        enable_deterministic_tf()
+        print("Deterministic TF ops enabled (TF_DETERMINISTIC_OPS=1).")
 
     print("\n" + "=" * 50)
     print("STEP 1: LOADING AND SEGMENTING MIT-BIH RECORDS")
     print("=" * 50)
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     data_path = get_mitdb_data_path(script_dir)
 
     record_names = load_record_names(data_path)
@@ -534,26 +717,112 @@ if __name__ == "__main__":
         print(f"  {k}: {float(class_weights[k])}")
 
     n_pac_train = int(np.sum(y_train == 2))
-    X_fit, y_fit, RR_fit = oversample_train_pac(X_train, y_train, RR_train)
     print(
-        f"\nPAC oversampling: {n_pac_train} PAC beats → "
-        f"{int(np.sum(y_fit == 2))} in fit set "
-        f"(1 + {PAC_OVERSAMPLE_EXTRA_COPIES} extra copies per PAC beat)"
+        f"\nPAC oversampling (per trial): {n_pac_train} PAC beats → "
+        f"(1 + {PAC_OVERSAMPLE_EXTRA_COPIES})× in fit set after copy+shuffle"
     )
 
-    model, history = train_resnet1d_rr_model(
-        X_fit,
-        y_fit,
-        RR_fit,
-        X_val,
-        y_val,
-        RR_val,
-        class_weights,
-        epochs=35,
-        batch_size=TRAIN_BATCH_SIZE,
-    )
+    class_names = {
+        0: "Normal (N)",
+        1: "PVC (V)",
+        2: "PAC (a)",
+    }
 
-    pac_tau = tune_pac_decision_threshold(model, X_val, y_val, RR_val)
+    best_score = None
+    best_weights = None
+    best_pac_tau = None
+    best_trial_idx = None
+    best_trial_seed = None
+    best_val_bacc = None
+    best_test_bacc = None
+
+    for trial_i in trial_indices:
+        trial_seed = trial_training_seed(base_seed, trial_i)
+        set_training_seeds(trial_seed)
+
+        print("\n" + "-" * 50)
+        print(
+            f"TRIAL {trial_i + 1}/{len(trial_indices)}  "
+            f"training_seed={trial_seed}  select_metric={select_metric}"
+        )
+        print("-" * 50)
+
+        X_fit, y_fit, RR_fit = oversample_train_pac(
+            X_train, y_train, RR_train, shuffle_seed=trial_seed
+        )
+
+        model, _ = train_resnet1d_rr_model(
+            X_fit,
+            y_fit,
+            RR_fit,
+            X_val,
+            y_val,
+            RR_val,
+            class_weights,
+            epochs=args.epochs,
+            batch_size=TRAIN_BATCH_SIZE,
+        )
+
+        tau_verbose = len(trial_indices) == 1 or bool(args.repro)
+        pac_tau = tune_pac_decision_threshold(
+            model, X_val, y_val, RR_val, verbose=tau_verbose
+        )
+
+        val_bacc = balanced_accuracy_with_tau(
+            model, X_val, y_val, RR_val, pac_tau
+        )
+        test_bacc = balanced_accuracy_with_tau(
+            model, X_test, y_test, RR_test, pac_tau
+        )
+
+        if select_metric == "test_balanced":
+            sel_score = test_bacc
+        else:
+            sel_score = val_bacc
+
+        print(
+            f"  Trial summary: val_balanced_acc={val_bacc:.4f}  "
+            f"test_balanced_acc={test_bacc:.4f}  score({select_metric})={sel_score:.4f}"
+        )
+
+        if best_score is None or sel_score > best_score + 1e-9:
+            best_score = sel_score
+            best_weights = model.get_weights()
+            best_pac_tau = pac_tau
+            best_trial_idx = trial_i
+            best_trial_seed = trial_seed
+            best_val_bacc = val_bacc
+            best_test_bacc = test_bacc
+
+    print("\n" + "=" * 50)
+    print(
+        f"BEST TRIAL: index={best_trial_idx}  training_seed={best_trial_seed}  "
+        f"{select_metric}={best_score:.4f}"
+    )
+    print(f"  val_balanced_accuracy={best_val_bacc:.4f}  "
+          f"test_balanced_accuracy={best_test_bacc:.4f}")
+    print("=" * 50)
+
+    set_training_seeds(best_trial_seed)
+    model = build_resnet1d_rr_model(n_classes=3)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.0003),
+        loss=sparse_categorical_crossentropy_with_label_smoothing(LABEL_SMOOTHING),
+        metrics=["accuracy"],
+    )
+    model.set_weights(best_weights)
+    pac_tau = best_pac_tau
+
+    if (not args.repro) and len(trial_indices) > 1 and best_trial_idx is not None:
+        if pac_tau is not None:
+            tune_msg = (
+                f"(PAC tau={pac_tau:.4f} from winning trial; "
+                f"val balanced acc with tau was {best_val_bacc:.4f})"
+            )
+        else:
+            tune_msg = "(Winning trial uses argmax; no PAC tau.)"
+        print(tune_msg)
+
     threshold_path = resnet_pac_threshold_path(script_dir)
     if pac_tau is not None:
         joblib.dump({"pac_threshold": pac_tau}, threshold_path)
@@ -562,11 +831,31 @@ if __name__ == "__main__":
         os.remove(threshold_path)
         print("Removed stale PAC threshold file (using argmax).")
 
-    class_names = {
-        0: "Normal (N)",
-        1: "PVC (V)",
-        2: "PAC (a)",
-    }
+    if args.repro:
+        meta_trials = int(repro_cfg.get("trials", 1))
+        meta_win_idx = int(repro_cfg.get("winning_trial_index", 0))
+        meta_base = int(repro_cfg.get("base_seed", base_seed))
+        meta_select = str(repro_cfg.get("select_metric", select_metric))
+    else:
+        meta_trials = len(trial_indices)
+        meta_win_idx = int(best_trial_idx)
+        meta_base = int(args.base_seed)
+        meta_select = str(select_metric)
+
+    joblib.dump(
+        {
+            "training_seed": int(best_trial_seed),
+            "select_metric": meta_select,
+            "trials": meta_trials,
+            "base_seed": meta_base,
+            "winning_trial_index": meta_win_idx,
+            "val_balanced_accuracy": float(best_val_bacc),
+            "test_balanced_accuracy": float(best_test_bacc),
+            "deterministic": bool(args.deterministic),
+        },
+        repro_path,
+    )
+    print(f"Saved repro metadata: {repro_path}")
 
     evaluate_resnet_rr(
         model,

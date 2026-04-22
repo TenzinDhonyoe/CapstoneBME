@@ -138,7 +138,8 @@ def main():
         )
 
     print(f"Loading model: {model_path}")
-    model = keras.models.load_model(model_path)
+    # compile=False: custom label-smoothing loss from training is not deserializable.
+    model = keras.models.load_model(model_path, compile=False)
     use_rr = _model_has_rr_input(model)
     scaler_path = resnet_rr_scaler_path(script_dir)
     rr_scaler = None
